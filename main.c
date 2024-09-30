@@ -653,7 +653,7 @@ void hid_event(int fd, struct input_event *ev)
             pushtime = -hid_pushtime.tv_sec * 1000 - (hid_pushtime.tv_nsec / 1000000);
             // LOG("PUSHTIME: %ld\n", pushtime);
 
-            stream.info_changed = INFO_DRAW_FINGER;
+            stream.info_changed |= INFO_DRAW_FINGER;
         }
 
         if (stream.hid_check || pushtime > MT_LONGPRESS)
@@ -681,7 +681,7 @@ void hid_event(int fd, struct input_event *ev)
             {
                 if (!push)
                 {
-                    stream.info_changed = INFO_DRAW_FINGER;
+                    stream.info_changed |= INFO_DRAW_FINGER;
 
                     if (stream.hid_action == A_SPEED && abs(stream.speed) > SPEED_PLAY)
                     {
