@@ -810,7 +810,16 @@ void hid_event(int fd, struct input_event *ev)
                     else if (stream.hid_action != action || stream.hid_param != param)
                     {
                         stream.hid_pushtime = ats;
-                        LOG("PUSH: %ld %ld\n", ats.tv_sec, ats.tv_nsec / 1000000);
+                        DBG("PUSH: %ld %ld\n", ats.tv_sec, ats.tv_nsec / 1000000);
+
+                        if (stream.hid_action != action && stream.hid_action == A_SPEED && abs(stream.speed) > SPEED_PLAY)
+                        {
+                            CAZ(pthread_mutex_lock(&stream.cmd_mutex));
+                            stream.speed = SPEED_PLAY;
+                            CAZ(pthread_cond_signal(&stream.cmd_cond));
+                            CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
+                            stream.info_changed = true;
+                        }
 
                         switch (action)
                         {
