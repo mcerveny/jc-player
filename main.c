@@ -331,8 +331,8 @@ struct
 
 } stream;
 
-#define INFO_WIDTH 1920
-#define INFO_HEIGHT 1200
+#define INFO_WIDTH (stream.crtc_width)
+#define INFO_HEIGHT (stream.crtc_height)
 
 #ifndef INFO_DRAW_FINGER
 #define INFO_DRAW_FINGER false
@@ -1497,6 +1497,7 @@ void info_setup()
     disp_plane_setup(stream.ui, DRM_FORMAT_ARGB8888, INFO_WIDTH, INFO_HEIGHT, pitches, offsets, 3);
 
     bzero(stream.info_fbs[0].map, stream.info_fbs[0].size);
+    //TODO: scaler for UI does not work (kernel driver dependent)
     disp_plane_scale(stream.ui, 0, 0, INFO_WIDTH, INFO_HEIGHT, 0, 0, stream.crtc_width, stream.crtc_height);
     disp_plane_show_pic(stream.ui, stream.info_fbs[0].fd);
 
