@@ -2213,6 +2213,7 @@ static void *stream_loader_thread(void *data)
         if (!chlen)
         {
             LOG("LD: not ready %s\n", stream.day);
+            disp_plane_hide(stream.vi);
             usleep(LOOP_USLEEP);
             continue;
         }
