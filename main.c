@@ -1606,7 +1606,9 @@ static int read_buffer(void *opaque, uint8_t *buf, int buf_size)
     buf_size = FFMIN(buf_size, bd->blen);
     if (!buf_size)
         return AVERROR_EOF;
+    alarm(6);
     memcpy(buf, bd->b, buf_size);
+    alarm(0);
     bd->b += buf_size;
     bd->blen -= buf_size;
     return buf_size;
@@ -1880,9 +1882,11 @@ void stream_map(uint64_t ms)
     snprintf(fn, sizeof(fn) - 1, "%s/" SRVF "/%s/" CAMF "/%lx.ts", stream.path, ck->srvid, stream.day, stream.camid, ms);
     LOG("L: loading %s\n", fn);
 
+    alarm(6);
     CAVZP(stream.decoder_loader_fd, open(fn, O_RDONLY));
     CAVP(stream.decoder_loader_bd.blen, lseek(stream.decoder_loader_fd, 0, SEEK_END));
     CAV(stream.decoder_loader_bd.b, mmap(NULL, stream.decoder_loader_bd.blen, PROT_READ, MAP_PRIVATE, stream.decoder_loader_fd, 0), != MAP_FAILED);
+    alarm(0);
 }
 
 static void *stream_decoder_thread(void *data)
@@ -2265,6 +2269,7 @@ void *stream_show_thread(void *param)
 
         CAZ(pthread_mutex_lock(&stream.decoder_mutex));
 
+reload:
         if (stream.show_msec_seek)
         {
             stream.show_msec = stream.show_msec_seek;
@@ -2308,7 +2313,10 @@ void *stream_show_thread(void *param)
                 // compute next frame
                 chunk_t _show_ms = {stream.show_ms, 0};
                 chunk_t *pms = bsearch(&_show_ms, stream.ch, stream.chlen, sizeof(stream.ch[0]), compare_chunk);
-                assert(pms);
+                if (!pms) {
+                    stream.show_msec_seek = stream.show_msec;
+                    goto reload;
+                }
 
                 if (stream.speed > 0)
                 {
@@ -2556,6 +2564,7 @@ int main(int argc, char **argv)
 
     signal(SIGINT, sig_handler);
     signal(SIGPIPE, sig_handler);
+    signal(SIGALRM, sig_handler);
 
     // initial params
     strncpy(stream.path, argv[1], sizeof(stream.path)-1);
