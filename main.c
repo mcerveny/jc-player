@@ -919,18 +919,7 @@ void hid_event(int fd, struct input_event *ev)
                             // reset camera, speed, ms
                             CAZ(pthread_mutex_lock(&stream.cmd_mutex));
                             stream.speed = SPEED_PLAY;
-                            // find first cam
-                            config_t *config;
-                            CAVNZ(config, get_config(stream.camid));
-                            uint8_t positionlen;
-                            config_t *cams[MAX_CAM];
-                            CAVNZ(positionlen, get_config_cam(config->mat, cams));
-                            for (i = 0; i < MAX_CAM; i++)
-                                if (cams[i])
-                                {
-                                    stream.camid_switch = cams[i]->camid;
-                                    break;
-                                }
+
                             struct timespec ts;
                             clock_gettime(CLOCK_REALTIME, &ts);
                             stream.show_msec_seek = ts.tv_sec * 1000 + ts.tv_nsec / NS_IN_MSEC - 5000; // start from t-5sec
