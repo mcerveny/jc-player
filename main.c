@@ -205,6 +205,7 @@ struct
     char path[96];
     char day[4 + 1 + 2 + 1 + 2 + 1], actualday[4 + 1 + 2 + 1 + 2 + 1];
     char masteruri[HOST_NAME_MAX];
+    char playerid[4];
     gui_t gui, config_gui;
 
     pthread_mutex_t rest_mutex;
@@ -404,6 +405,8 @@ struct
 #define HID_ZOOM_DIV (200)
 #define HID_ZOOM_MAX (600)
 
+void info_cfg_load();
+
 config_t *get_config(uint8_t camid)
 {
     int i;
@@ -430,6 +433,70 @@ uint8_t get_config_cam(uint8_t mat, config_t *cams[MAX_CAM])
         }
 
     return camscnt;
+}
+
+void get_player_cam()
+{
+    // with stream.cmd_mutex
+    stream.camid_switch = 0;
+    stream.speed = SPEED_PLAY;
+    stream.info_changed = true;
+    info_cfg_load();
+
+    if (!strcmp(stream.day, stream.actualday))
+    {
+        struct _u_request request;
+        struct _u_response response;
+        json_t *json;
+        ulfius_init_request(&request);
+        ulfius_init_response(&response);
+        CAZ(ulfius_set_request_properties(&request,
+                                          U_OPT_HTTP_VERB, "GET",
+                                          U_OPT_HTTP_URL, stream.masteruri,
+                                          U_OPT_HTTP_URL_APPEND, "/players",
+                                          U_OPT_HTTP_URL_APPEND, "/",
+                                          U_OPT_HTTP_URL_APPEND, stream.playerid,
+                                          U_OPT_TIMEOUT, 1ul,
+                                          U_OPT_NONE));
+        CAZ(ulfius_send_http_request(&request, &response));
+        CAVNZ(json, ulfius_get_json_body_response(&response, NULL));
+        ulfius_clean_response(&response);
+        ulfius_clean_request(&request);
+
+        A(json_is_object(json));
+        json_t *value = json_object_get(json, "camid");
+        if (value)
+        {
+            stream.camid_switch = json_integer_value(value);
+            config_t *config = get_config(stream.camid_switch);
+            if (!config)
+                stream.camid_switch = 0;
+        }
+        json_decref(json);
+    }
+}
+
+void set_player_cam()
+{
+    if (!strcmp(stream.day, stream.actualday))
+    {
+        struct _u_request request;
+        json_t *json;
+        CAVNZ(json, json_pack("{s:i}", "camid", stream.camid_switch));
+        ulfius_init_request(&request);
+        CAZ(ulfius_set_request_properties(&request,
+                                          U_OPT_HTTP_VERB, "POST",
+                                          U_OPT_HTTP_URL, stream.masteruri,
+                                          U_OPT_HTTP_URL_APPEND, "/players",
+                                          U_OPT_HTTP_URL_APPEND, "/",
+                                          U_OPT_HTTP_URL_APPEND, stream.playerid,
+                                          U_OPT_JSON_BODY, json,
+                                          U_OPT_TIMEOUT, 1ul,
+                                          U_OPT_NONE));
+        CAZ(ulfius_send_http_request(&request, NULL));
+        ulfius_clean_request(&request);
+        json_decref(json);
+    }
 }
 
 void normalize_ts(struct timespec *ts)
@@ -696,11 +763,8 @@ void hid_event(int fd, struct input_event *ev)
                     {
                         CAZ(pthread_mutex_lock(&stream.cmd_mutex));
                         stream.info_config_switching = false;
-                        stream.camid_switch = 0;
-
                         stream.gui = GUI_PLAYER;
-                        info_cfg_load();
-
+                        get_player_cam();
                         CAZ(pthread_cond_signal(&stream.cmd_cond));
                         CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
                         stream.info_changed = true;
@@ -749,6 +813,7 @@ void hid_event(int fd, struct input_event *ev)
 
                             CAZ(pthread_cond_signal(&stream.cmd_cond));
                             CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
+
                             stream.info_changed = true;
                         }
                         else if (action == A_BRS_DELETE && (param < stream.info_browselen && !strcmp(stream.info_browse[param], stream.day)))
@@ -856,6 +921,7 @@ void hid_event(int fd, struct input_event *ev)
                                     }
                             }
                             stream.speed = SPEED_PLAY;
+                            set_player_cam();
 
                             CAZ(pthread_cond_signal(&stream.cmd_cond));
                             CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
@@ -885,6 +951,7 @@ void hid_event(int fd, struct input_event *ev)
                                         }
                                         camid++;
                                     }
+                                set_player_cam();
 
                                 CAZ(pthread_cond_signal(&stream.cmd_cond));
                                 CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
@@ -1494,8 +1561,8 @@ void info_setup()
     pitches[0] = stream.info_fbs[0].pitch;
     disp_plane_setup(stream.ui, DRM_FORMAT_ARGB8888, INFO_WIDTH, INFO_HEIGHT, pitches, offsets, 3);
 
-    bzero(stream.info_fbs[0].map, stream.info_fbs[0].size);
-    //TODO: scaler for UI does not work (kernel driver dependent)
+    memset(stream.info_fbs[0].map, 0, stream.info_fbs[0].size);
+    // TODO: scaler for UI does not work (kernel driver dependent)
     disp_plane_scale(stream.ui, 0, 0, INFO_WIDTH, INFO_HEIGHT, 0, 0, stream.crtc_width, stream.crtc_height);
     disp_plane_show_pic(stream.ui, stream.info_fbs[0].fd);
 
@@ -2258,7 +2325,7 @@ void *stream_show_thread(void *param)
 
         CAZ(pthread_mutex_lock(&stream.decoder_mutex));
 
-reload:
+    reload:
         if (stream.show_msec_seek)
         {
             stream.show_msec = stream.show_msec_seek;
@@ -2302,7 +2369,8 @@ reload:
                 // compute next frame
                 chunk_t _show_ms = {stream.show_ms, 0};
                 chunk_t *pms = bsearch(&_show_ms, stream.ch, stream.chlen, sizeof(stream.ch[0]), compare_chunk);
-                if (!pms) {
+                if (!pms)
+                {
                     stream.show_msec_seek = stream.show_msec;
                     goto reload;
                 }
@@ -2556,14 +2624,14 @@ int main(int argc, char **argv)
     signal(SIGALRM, sig_handler);
 
     // initial params
-    strncpy(stream.path, argv[1], sizeof(stream.path)-1);
-    strncpy(stream.masteruri, argv[2], sizeof(stream.masteruri)-1);
+    strncpy(stream.path, argv[1], sizeof(stream.path) - 1);
+    strncpy(stream.masteruri, argv[2], sizeof(stream.masteruri) - 1);
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     strftime(stream.actualday, sizeof(stream.actualday), "%Y-%m-%d", localtime(&ts.tv_sec));
     if (argc == 4)
-        strncpy(stream.day, argv[3], sizeof(stream.day)-1);
+        strncpy(stream.day, argv[3], sizeof(stream.day) - 1);
     else
         strcpy(stream.day, stream.actualday);
 
@@ -2571,6 +2639,11 @@ int main(int argc, char **argv)
         stream.config_gui = GUI_BROWSE;
     else
         stream.config_gui = GUI_CONFIG;
+
+    char hn[HOST_NAME_MAX];
+    CAZ(gethostname(hn, sizeof(hn)));
+    CAZ(strncmp(hn, "player", sizeof("player") - 1));
+    strncat(stream.playerid, hn + sizeof("player") - 1, sizeof(stream.playerid) - 1);
 
     // initicialization
     CAZ(pthread_mutex_init(&stream.rest_mutex, NULL));
@@ -2595,14 +2668,18 @@ int main(int argc, char **argv)
 
     srand((unsigned int)time(NULL));
 
+    CAZ(pthread_mutex_lock(&stream.cmd_mutex));
+    get_player_cam();
+    CAZ(pthread_cond_signal(&stream.cmd_cond));
+    CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
+
     while (!stream.stopping)
     {
-        if (stream.gui != GUI_BROWSE)
+        if (stream.gui != GUI_BROWSE && stream.camid == stream.camid_switch)
         {
             CAZ(pthread_mutex_lock(&stream.cmd_mutex));
 
             info_cfg_load();
-
             config_t *config = get_config(stream.camid);
             if (!config)
             {
