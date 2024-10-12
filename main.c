@@ -1817,7 +1817,7 @@ void stream_decode(uint8_t *bf, int bflen, uint64_t ms, uint32_t from, uint32_t 
 {
     uint8_t *avio_ctx_buffer;
 
-    LOG("DECODE %lu/%d-%d\n", ms, from, to);
+    DBG("DECODE %lu/%d-%d enter\n", ms, from, to);
 
     assert(from <= STREAM_FRAMES && to <= STREAM_FRAMES);
 
@@ -1826,7 +1826,7 @@ void stream_decode(uint8_t *bf, int bflen, uint64_t ms, uint32_t from, uint32_t 
         _from = ((from / skip + 1) * skip);
     to = ((to - 1) / skip * skip) + 1;
 
-    // DBG("DECODE %lu/%d-%d align\n", ms, from, to);
+    LOG("DECODE %lu/%d-%d\n", ms, from, to);
 
     if (!(ms == stream.decode_ms && stream.decode_id <= from))
     {
@@ -2496,6 +2496,7 @@ void *stream_cmd_thread(void *param)
 {
     LOG("COMMANDER THREAD START\n");
     uint32_t speed_prev = ~0;
+    uint32_t speed_bigskip = 4;
 
     stream.switching = true;
 
@@ -2512,6 +2513,7 @@ void *stream_cmd_thread(void *param)
                 stream.show_id = stream.show_id / speed_params[abs(stream.speed)].skip * speed_params[abs(stream.speed)].skip;
             stream.show_skip = speed_params[abs(stream.speed)].skip;
             stream.show_wait = speed_params[abs(stream.speed)].wait;
+            speed_bigskip = 4;
             LOG("C: change speed %d/%ld (new %d)\n", stream.show_skip, stream.show_wait / NS_IN_MSEC, stream.show_id);
             CAZ(pthread_mutex_unlock(&stream.decoder_mutex));
             speed_prev = stream.speed;
@@ -2527,7 +2529,28 @@ void *stream_cmd_thread(void *param)
                 DBG("C: boost skip %ld\n", stream.show_wait / NS_IN_MSEC);
             }
             else
-                stream.show_wait = STREAM_FPS_NSEC;
+            {
+                speed_bigskip++;
+                wt = stream.show_wait = STREAM_FPS_NSEC * 2;
+                chunk_t _show_ms = {stream.show_ms, 0};
+                chunk_t *pms = bsearch(&_show_ms, stream.ch, stream.chlen, sizeof(stream.ch[0]), compare_chunk);
+                if (pms)
+                {
+                    if (stream.speed == -SPEED_SKIP)
+                    {
+                        pms -= speed_bigskip/2;
+                        if (pms < stream.ch)
+                            pms = stream.ch;
+                    }
+                    else
+                    {
+                        pms += speed_bigskip/2;
+                        if (pms > stream.ch + stream.chlen)
+                            pms = stream.ch + stream.chlen - 1;
+                    }
+                    stream.show_msec_seek = pms->ms;
+                }
+            }
             CAZ(pthread_mutex_unlock(&stream.decoder_mutex));
         }
         if (stream.camid != stream.camid_switch)
