@@ -10,7 +10,7 @@ SPDX-FileCopyrightText: 2023 Martin Cerveny <martin@c-home.cz>
 
 int hid_setup(char *cmd_param);
 void hid_cleanup(void);
-void hid_ping(void);
+bool hid_ping(void);
 
 void hid_event(int fd, struct input_event *ev);
 

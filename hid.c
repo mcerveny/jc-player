@@ -42,6 +42,7 @@ typedef struct hid_mon
     struct hid_mon *next;
     pthread_t tid;
     int fd;
+    bool touch;
     char name[512];
 } hid_mon_t;
 
@@ -87,6 +88,7 @@ static void *hid_mon_thread(void *data)
 
     char name[256];
     char phys[256];
+    unsigned long prop_bitmask;
 
     if (ioctl(hid_mon->fd, EVIOCGNAME(sizeof(name)), name) < 0)
     {
@@ -99,6 +101,13 @@ static void *hid_mon_thread(void *data)
         ERR("event ioctl %s\n", strerror(errno));
     }
     LOG("event[%d] phys %s\n", hid_mon->fd, phys);
+
+    if (ioctl(hid_mon->fd, EVIOCGPROP(sizeof(prop_bitmask)), &prop_bitmask) < 0)
+    {
+        ERR("event ioctl %s\n", strerror(errno));
+    }
+    LOG("event[%d] props %lx\n", hid_mon->fd, prop_bitmask);
+    hid_mon->touch = !!(prop_bitmask & (1 << INPUT_PROP_DIRECT));
 
     char evtype_b[8];
     memset(evtype_b, 0, sizeof(evtype_b));
@@ -163,10 +172,12 @@ static void *hid_mon_thread(void *data)
     return NULL;
 }
 
-static void hid_check_and_open()
+static bool hid_check_and_open()
 {
+    bool touch = false;
+
     if (!hid.run)
-        return;
+        return touch;
 
     DIR *dir = opendir("/dev/input");
     if (dir != NULL)
@@ -190,12 +201,15 @@ static void hid_check_and_open()
                     hid_mon = hid_mon->next;
                 }
                 if (hid_mon)
+                {
+                    touch |= hid_mon->touch;
                     continue;
+                }
 
                 // add new
                 hid_mon = malloc(sizeof(hid_mon_t));
                 strncpy(hid_mon->name, name, sizeof(hid_mon->name) - 1);
-               
+
                 hid_mon->fd = open(hid_mon->name, O_RDWR);
                 if (hid_mon->fd < 0)
                 {
@@ -217,6 +231,8 @@ static void hid_check_and_open()
         pthread_mutex_unlock(&hid.mutex);
         closedir(dir);
     }
+
+    return touch;
 }
 
 int hid_setup(char *cmd_param)
@@ -247,7 +263,7 @@ void hid_cleanup(void)
     pthread_mutex_destroy(&hid.mutex);
 }
 
-void hid_ping(void)
+bool hid_ping(void)
 {
-    hid_check_and_open();
+    return hid_check_and_open();
 }

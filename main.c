@@ -256,7 +256,7 @@ struct
     } info_fbs[2];
     FT_Library info_library;
     FT_Face info_face;
-    img_t info_timg[11], info_cbimg[5], info_cimg[2], info_simg[5][2], info_rimg[2], info_fimg;
+    img_t info_timg[12], info_cbimg[5], info_cimg[2], info_simg[5][2], info_rimg[2], info_fimg;
     int8_t info_width[-SPEED_BCK_SKIP + SPEED_SKIP + 1];
     bool info_restore_prev;
 
@@ -266,6 +266,7 @@ struct
     bool info_changed;
     bool info_config_switching;
     bool info_paused;
+    bool info_touch;
 
     // decoder
     pthread_mutex_t decoder_mutex;
@@ -348,6 +349,16 @@ struct
 #define INFO_RIMG INFO_PREFIX "r%d.png"
 #define INFO_FIMG INFO_PREFIX "finger.png"
 #define INFO_FONT_LINE 50
+
+#define INFO_CBIMG_NO 0
+#define INFO_CBIMG_YES 1
+#define INFO_CBIMG_SELECTED 2
+#define INFO_CBIMG_PAUSED 3
+#define INFO_CBIMG_RECORDING 4
+
+#define INFO_TIMG_SETUP 9
+#define INFO_TIMG_BROWSE 10
+#define INFO_TIMG_NOTOUCH 11
 
 #define INFO_BORDER 20
 
@@ -1416,8 +1427,8 @@ void *stream_info_thread(void *param)
         switch (stream.gui)
         {
         case GUI_CONFIG:
-            info_img(fb, INFO_MAT_X, INFO_MAT_Y, &stream.info_timg[9], false);
-            on = stream.info_paused ? 3 : 4;
+            info_img(fb, INFO_MAT_X, INFO_MAT_Y, &stream.info_timg[INFO_TIMG_SETUP], false);
+            on = stream.info_paused ? INFO_CBIMG_PAUSED : INFO_CBIMG_RECORDING;
             info_img(fb, INFO_PAUSE_X, INFO_PAUSE_Y, &stream.info_cbimg[on], false);
 
             for (int _mat = 0; _mat < MAX_MAT; _mat++)
@@ -1436,7 +1447,7 @@ void *stream_info_thread(void *param)
                             break;
                         }
                     CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
-                    on = (_mat + 1 == mat && _position + 1 == position) ? (stream.info_config_switching ? 2 : 1) : 0;
+                    on = (_mat + 1 == mat && _position + 1 == position) ? (stream.info_config_switching ? INFO_CBIMG_SELECTED : INFO_CBIMG_YES) : INFO_CBIMG_NO;
                     uint32_t fx = x - INFO_BORDER / 2 - INFO_CONFIG_CAM_W + (_position % 2) * (INFO_BORDER + INFO_CONFIG_CAM_W),
                              fy = y + INFO_BORDER / 2 + INFO_MAT_H / 2 - (INFO_CONFIG_CAM_H + INFO_MAT_H + INFO_BORDER) * (_position / 2);
                     info_img(fb, fx, fy, &stream.info_cbimg[on], (_position % 2));
@@ -1451,7 +1462,7 @@ void *stream_info_thread(void *param)
             break;
 
         case GUI_BROWSE:
-            info_img(fb, INFO_MAT_X, INFO_MAT_Y, &stream.info_timg[10], false);
+            info_img(fb, INFO_MAT_X, INFO_MAT_Y, &stream.info_timg[INFO_TIMG_BROWSE], false);
             int i = 0;
             for (y = INFO_BROWSE_Y; y < INFO_HEIGHT - INFO_BROWSE_H + INFO_BORDER && i < stream.info_browselen; y += INFO_BROWSE_H + INFO_BORDER)
                 for (x = INFO_BROWSE_X; x < INFO_WIDTH - INFO_BROWSE_W + 2 * INFO_BORDER && i < stream.info_browselen; x += INFO_BROWSE_W + 2 * INFO_BORDER)
@@ -1531,6 +1542,12 @@ void *stream_info_thread(void *param)
                 info_img(fb, INFO_RESTORE_X, INFO_BOTTOM_Y, &stream.info_rimg[on], false);
             }
             break;
+        }
+
+        if (!stream.info_touch)
+        {
+            info_fill(fb, INFO_MAT_X, INFO_MAT_Y, stream.info_timg[INFO_TIMG_NOTOUCH].width, stream.info_timg[INFO_TIMG_NOTOUCH].height, 0);
+            info_img(fb, INFO_MAT_X, INFO_MAT_Y, &stream.info_timg[INFO_TIMG_NOTOUCH], false);
         }
 
         if (INFO_DRAW_FINGER)
@@ -2538,13 +2555,13 @@ void *stream_cmd_thread(void *param)
                 {
                     if (stream.speed == -SPEED_SKIP)
                     {
-                        pms -= speed_bigskip/2;
+                        pms -= speed_bigskip / 2;
                         if (pms < stream.ch)
                             pms = stream.ch;
                     }
                     else
                     {
-                        pms += speed_bigskip/2;
+                        pms += speed_bigskip / 2;
                         if (pms > stream.ch + stream.chlen)
                             pms = stream.ch + stream.chlen - 1;
                     }
@@ -2743,7 +2760,11 @@ int main(int argc, char **argv)
             }
         }
 
-        hid_ping();
+        stream.info_touch = hid_ping();
+        if (!stream.info_touch)
+        {
+            stream.hid_absfd = 0;
+        }
         usleep(LOOP_USLEEP);
     }
 
