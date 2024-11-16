@@ -79,15 +79,24 @@ SPDX-FileCopyrightText: 2023 Martin Cerveny <martin@c-home.cz>
 #define STREAM_MAX_FILES 24000
 #define MAX_CAM 4
 #define MAX_MAT 8
+#define MAX_BROWSE (4 * 8)
+#define MAX_BOOKMARKS (5 * 7)
+#define MAX_MEDICALS 256
+
+#define MEDICAL_EXTEND 20 // timeframe to extend existing medical start or stop
+#define MEDICAL_DELETE 5  // minimum medical duration, otherwise delete
+#define BOOKMARK_DELAY 5  // GUI select time
 
 #define SRVF "srv%d"
 #define CAMF "cam%02d"
 
 typedef enum
 {
+    GUI_EMPTY,
     GUI_PLAYER,
     GUI_CONFIG,
     GUI_BROWSE,
+    GUI_BOOKMARKS,
 } gui_t;
 
 #define MT_FINGERS 2
@@ -136,7 +145,12 @@ typedef enum
     A_CFG_PAUSE,
     A_BRS_SELECT,
     A_BRS_DELETE,
-
+    A_BOOKMARK_ADD,
+    A_BOOKMARK_SHOW,
+    A_BOOKMARK_SELECT,
+    A_BOOKMARK_DELETE,
+    A_MEDICAL_START,
+    A_MEDICAL_STOP,
 } action_t;
 
 struct
@@ -245,6 +259,12 @@ struct
 
     // info_mutex
     struct timespec info_time;
+    time_t info_bookmarks[MAX_BOOKMARKS];
+    int info_bookmarkslen;
+    time_t info_medicals[MAX_MEDICALS]; // tuples start/stop
+    int info_medicalslen;
+    bool info_updating;
+    uint32_t info_loadedmat;
 
     // private
     struct
@@ -256,11 +276,11 @@ struct
     } info_fbs[2];
     FT_Library info_library;
     FT_Face info_face;
-    img_t info_timg[12], info_cbimg[5], info_cimg[2], info_simg[5][2], info_rimg[2], info_fimg;
+    img_t info_timg[12], info_cbimg[5], info_cimg[2], info_simg[5][2], info_rimg[2], info_fimg, info_oimg[9];
     int8_t info_width[-SPEED_BCK_SKIP + SPEED_SKIP + 1];
     bool info_restore_prev;
 
-    char info_browse[20 * 4][4 + 1 + 2 + 1 + 2 + 1];
+    char info_browse[MAX_BROWSE][4 + 1 + 2 + 1 + 2 + 1];
     int info_browselen;
     bool info_browse_deleting;
     bool info_changed;
@@ -348,6 +368,7 @@ struct
 #define INFO_SIMG INFO_PREFIX "s%d%d.png"
 #define INFO_RIMG INFO_PREFIX "r%d.png"
 #define INFO_FIMG INFO_PREFIX "finger.png"
+#define INFO_OIMG INFO_PREFIX "o%d.png"
 #define INFO_FONT_LINE 50
 
 #define INFO_CBIMG_NO 0
@@ -359,6 +380,16 @@ struct
 #define INFO_TIMG_SETUP 9
 #define INFO_TIMG_BROWSE 10
 #define INFO_TIMG_NOTOUCH 11
+
+#define INFO_OIMG_BOOKMARKADD 0
+#define INFO_OIMG_BOOKMARKADDSEL 1
+#define INFO_OIMG_BOOKMARKSHOW 2
+#define INFO_OIMG_BOOKMARKSHOWSEL 3
+#define INFO_OIMG_MEDICALSTART 4
+#define INFO_OIMG_MEDICALSTARTSEL 5
+#define INFO_OIMG_MEDICALSTOP 6
+#define INFO_OIMG_MEDICALSTOPSEL 7
+#define INFO_OIMG_MEDICAL 8
 
 #define INFO_BORDER 20
 
@@ -382,6 +413,16 @@ struct
 #define INFO_BROWSE_FG 0xffffffff
 #define INFO_BROWSE_FGS 0xff000000
 #define INFO_BROWSE_FGD 0xffff0000
+
+#define INFO_BOOKMARK_W (320 + 2 * INFO_BORDER)
+#define INFO_BOOKMARK_H (INFO_FONT_LINE + 2 * INFO_BORDER)
+#define INFO_BOOKMARK_X (INFO_BORDER)
+#define INFO_BOOKMARK_Y (INFO_MAT_Y + INFO_MAT_H + 2 * INFO_BORDER)
+#define INFO_BOOKMARK_BG 0x80303030
+#define INFO_BOOKMARK_BGS 0xa0ffffff
+#define INFO_BOOKMARK_FG 0x80ffffff
+#define INFO_BOOKMARK_FGS 0xa0000000
+#define INFO_BOOKMARK_FGD 0xa0ff0000
 
 #define INFO_CONFIG_NEXT_X 240
 #define INFO_CONFIG_X (INFO_BORDER + INFO_CONFIG_CAM_W / 2 + INFO_MAT_W / 2)
@@ -444,6 +485,109 @@ uint8_t get_config_cam(uint8_t mat, config_t *cams[MAX_CAM])
         }
 
     return camscnt;
+}
+
+void mat_load(uint8_t matid)
+{
+    int i;
+    if (stream.info_updating)
+        return;
+
+    // LOG("load mat %d\n", matid);
+
+    struct _u_request request;
+    struct _u_response response;
+    json_t *json, *jsona;
+    char _mat[4];
+    CAP(snprintf(_mat, sizeof(_mat), "%u", matid));
+
+    ulfius_init_request(&request);
+    ulfius_init_response(&response);
+    CAZ(ulfius_set_request_properties(&request,
+                                      U_OPT_HTTP_VERB, "GET",
+                                      U_OPT_HTTP_URL, stream.masteruri,
+                                      U_OPT_HTTP_URL_APPEND, "/mats/",
+                                      U_OPT_HTTP_URL_APPEND, stream.day,
+                                      U_OPT_HTTP_URL_APPEND, "/",
+                                      U_OPT_HTTP_URL_APPEND, _mat,
+                                      U_OPT_TIMEOUT, 1ul,
+                                      U_OPT_NONE));
+    CAZ(ulfius_send_http_request(&request, &response));
+    CAVNZ(json, ulfius_get_json_body_response(&response, NULL));
+    ulfius_clean_response(&response);
+    ulfius_clean_request(&request);
+
+    A(json_is_object(json));
+
+    time_t info_bookmarks[MAX_BOOKMARKS];
+    int info_bookmarkslen = 0;
+    jsona = json_object_get(json, "bookmarks");
+    if (jsona)
+    {
+        A(json_is_array(jsona));
+        info_bookmarkslen = json_array_size(jsona);
+        for (i = 0; i < info_bookmarkslen; i++)
+            info_bookmarks[i] = json_integer_value(json_array_get(jsona, i));
+    }
+
+    time_t info_medicals[MAX_MEDICALS];
+    int info_medicalslen = 0;
+    jsona = json_object_get(json, "medicals");
+    if (jsona)
+    {
+        A(json_is_array(jsona));
+        info_medicalslen = json_array_size(jsona);
+        for (i = 0; i < info_medicalslen; i++)
+            info_medicals[i] = json_integer_value(json_array_get(jsona, i));
+    }
+
+    json_decref(json);
+
+    CAZ(pthread_mutex_lock(&stream.info_mutex));
+    if (stream.info_updating)
+    {
+        CAZ(pthread_mutex_unlock(&stream.info_mutex));
+        return;
+    }
+    stream.info_bookmarkslen = info_bookmarkslen;
+    memcpy(stream.info_bookmarks, info_bookmarks, sizeof(info_bookmarks[0]) * info_bookmarkslen);
+    stream.info_medicalslen = info_medicalslen;
+    memcpy(stream.info_medicals, info_medicals, sizeof(info_medicals[0]) * info_medicalslen);
+    stream.info_loadedmat = matid;
+    CAZ(pthread_mutex_unlock(&stream.info_mutex));
+}
+
+void mat_patch(char *arrayname, time_t *array, int arraylen)
+{
+    struct _u_request request;
+    json_t *json, *jsona;
+    char _mat[4];
+    CAP(snprintf(_mat, sizeof(_mat), "%u", stream.info_loadedmat));
+
+    CAVNZ(jsona, json_array());
+    for (int i = 0; i < arraylen; i++)
+        CAZ(json_array_append(jsona, json_integer(array[i])));
+
+    CAZ(pthread_mutex_unlock(&stream.info_mutex));
+
+    CAVNZ(json, json_object());
+    CAZ(json_object_set(json, arrayname, jsona));
+
+    ulfius_init_request(&request);
+    CAZ(ulfius_set_request_properties(&request,
+                                      U_OPT_HTTP_VERB, "PATCH",
+                                      U_OPT_HTTP_URL, stream.masteruri,
+                                      U_OPT_HTTP_URL_APPEND, "/mats/",
+                                      U_OPT_HTTP_URL_APPEND, stream.day,
+                                      U_OPT_HTTP_URL_APPEND, "/",
+                                      U_OPT_HTTP_URL_APPEND, _mat,
+                                      U_OPT_JSON_BODY, json,
+                                      U_OPT_TIMEOUT, 20ul,
+                                      U_OPT_NONE));
+    CAZ(ulfius_send_http_request(&request, NULL));
+    ulfius_clean_request(&request);
+    json_decref(json);
+    CAZ(pthread_mutex_lock(&stream.info_mutex));
 }
 
 void get_player_cam()
@@ -546,6 +690,8 @@ void info_browse_refresh()
 
     A(json_is_array(json));
     stream.info_browselen = json_array_size(json);
+    if (stream.info_browselen > MAX_BROWSE)
+        stream.info_browselen = MAX_BROWSE;
     A(stream.info_browselen < sizeof(stream.info_browse) / sizeof(stream.info_browse[0]));
     for (int i = 0; i < stream.info_browselen; i++)
     {
@@ -670,7 +816,7 @@ void hid_event(int fd, struct input_event *ev)
     struct timespec ats;
     clock_gettime(CLOCK_REALTIME, &ats);
 
-    // LOG("MT: [%d/%d] %x %x %d\n", fd, stream.hid_absfd, ev->type, ev->code, ev->value);
+    // DBG("MT: [%d/%d] %x %x %d\n", fd, stream.hid_absfd, ev->type, ev->code, ev->value);
     if (ev->type == EV_ABS && (!stream.hid_absfd || stream.hid_absfd == fd))
     {
         switch (ev->code)
@@ -682,7 +828,7 @@ void hid_event(int fd, struct input_event *ev)
                 stream.hid_slot = -1;
             break;
         case ABS_MT_TRACKING_ID:
-            LOG("MT: id %d fd %d\n", ev->value, fd);
+            // DBG("MT: id %d fd %d\n", ev->value, fd);
             if (!stream.hid_absfd)
             {
                 stream.hid_absfd = fd;
@@ -753,7 +899,7 @@ void hid_event(int fd, struct input_event *ev)
             action_t action = stream.hid_actions[i].action;
             int param = stream.hid_actions[i].param;
 
-            // LOG("MT: finger[%d] %d %d %d %d %d\n", finger, x, y, push, action, param);
+            LOG("MT: finger[%d] %d:%d %d %d/%d\n", finger, x, y, push, action, param);
 
             if (finger == 0)
             {
@@ -1048,6 +1194,7 @@ void hid_event(int fd, struct input_event *ev)
                         break;
                         case A_BRS_SELECT:
                         case A_BRS_DELETE:
+                        {
                             if (param < stream.info_browselen)
                             {
                                 CAZ(pthread_mutex_lock(&stream.cmd_mutex));
@@ -1058,8 +1205,10 @@ void hid_event(int fd, struct input_event *ev)
                                 stream.hid_param = param;
                                 stream.info_changed = true;
                             }
-                            break;
+                        }
+                        break;
                         case A_CFG_SELECT:
+                        {
                             CAZ(pthread_mutex_lock(&stream.cmd_mutex));
                             for (i = 0; i < stream.configslen; i++)
                                 if ((param & 0xff00) >> 8 == stream.configs[i].mat && (param & 0xff) == stream.configs[i].position)
@@ -1101,7 +1250,184 @@ void hid_event(int fd, struct input_event *ev)
                             stream.hid_param = param;
 
                             stream.info_changed = true;
-                            break;
+                        }
+                        break;
+                        case A_BOOKMARK_ADD:
+                        {
+                            CAZ(pthread_mutex_lock(&stream.cmd_mutex));
+                            config_t *config;
+                            CAVNZ(config, get_config(stream.camid));
+                            uint8_t matid = config ? config->mat : 0;
+                            CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
+
+                            if (matid && stream.info_loadedmat == matid)
+                            {
+                                CAZ(pthread_mutex_lock(&stream.info_mutex));
+                                if (stream.info_bookmarkslen < MAX_BOOKMARKS)
+                                {
+                                    for (i = 0; i < stream.info_bookmarkslen; i++)
+                                        if (stream.info_bookmarks[i] >= stream.info_time.tv_sec)
+                                            break;
+                                    if (stream.info_bookmarks[i] != stream.info_time.tv_sec)
+                                    {
+                                        memmove(stream.info_bookmarks + i + 1, stream.info_bookmarks + i, sizeof(stream.info_bookmarks[0]) * stream.info_bookmarkslen - i);
+                                        stream.info_bookmarks[i] = stream.info_time.tv_sec;
+                                        stream.info_bookmarkslen++;
+                                        stream.info_updating = true;
+                                    }
+                                }
+
+                                if (stream.info_updating)
+                                    mat_patch("bookmarks", stream.info_bookmarks, stream.info_bookmarkslen);
+                                CAZ(pthread_mutex_unlock(&stream.info_mutex));
+                            }
+
+                            stream.info_updating = false;
+                            stream.hid_action = action;
+                            stream.hid_param = param;
+                            stream.info_changed = true;
+                        }
+                        break;
+                        case A_BOOKMARK_SHOW:
+                        {
+                            stream.gui = stream.gui == GUI_PLAYER ? GUI_BOOKMARKS : GUI_PLAYER;
+                            stream.hid_action = action;
+                            stream.hid_param = param;
+                            stream.info_changed = true;
+                        }
+                        break;
+                        case A_BOOKMARK_SELECT:
+                        {
+                            time_t sec = 0;
+
+                            CAZ(pthread_mutex_lock(&stream.info_mutex));
+                            if (param < stream.info_bookmarkslen)
+                                sec = stream.info_bookmarks[param];
+                            CAZ(pthread_mutex_unlock(&stream.info_mutex));
+
+                            if (sec)
+                            {
+                                scale_reset();
+                                CAZ(pthread_mutex_lock(&stream.cmd_mutex));
+                                stream.speed = SPEED_PLAY;
+                                stream.show_msec_seek = sec * 1000;
+                                CAZ(pthread_cond_signal(&stream.cmd_cond));
+                                CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
+                            }
+
+                            stream.hid_action = action;
+                            stream.hid_param = param;
+                            stream.info_changed = true;
+                        }
+                        break;
+                        case A_BOOKMARK_DELETE:
+                        {
+                            CAZ(pthread_mutex_lock(&stream.cmd_mutex));
+                            config_t *config;
+                            CAVNZ(config, get_config(stream.camid));
+                            uint8_t matid = config ? config->mat : 0;
+                            CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
+
+                            if (matid && stream.info_loadedmat == matid)
+                            {
+                                CAZ(pthread_mutex_lock(&stream.info_mutex));
+                                struct timespec info_time = stream.info_time;
+                                if (param < stream.info_bookmarkslen)
+                                {
+
+                                    int in_bookmark_idx = -1;
+                                    for (i = 0; i < stream.info_bookmarkslen; i++)
+                                        if (info_time.tv_sec >= stream.info_bookmarks[i] && (i == stream.info_bookmarkslen - 1 || info_time.tv_sec < stream.info_bookmarks[i + 1]))
+                                        {
+                                            in_bookmark_idx = i;
+                                            break;
+                                        }
+
+                                    if (param == in_bookmark_idx)
+                                    {
+                                        memmove(stream.info_bookmarks + param, stream.info_bookmarks + param + 1, sizeof(stream.info_bookmarks[0]) * stream.info_bookmarkslen - param - 1);
+                                        stream.info_bookmarkslen--;
+                                    }
+                                    stream.info_updating = true;
+                                }
+                                if (stream.info_updating)
+                                    mat_patch("bookmarks", stream.info_bookmarks, stream.info_bookmarkslen);
+                                CAZ(pthread_mutex_unlock(&stream.info_mutex));
+                            }
+
+                            stream.info_updating = false;
+                            stream.hid_action = action;
+                            stream.hid_param = param;
+                            stream.info_changed = true;
+                        }
+                        break;
+                        case A_MEDICAL_STOP:
+                        case A_MEDICAL_START:
+                        {
+                            CAZ(pthread_mutex_lock(&stream.cmd_mutex));
+                            config_t *config;
+                            CAVNZ(config, get_config(stream.camid));
+                            uint8_t matid = config ? config->mat : 0;
+                            CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
+
+                            if (matid && stream.info_loadedmat == matid)
+                            {
+                                CAZ(pthread_mutex_lock(&stream.info_mutex));
+                                struct timespec info_time = stream.info_time;
+
+                                int in_medical_idx = -1;
+                                for (i = 0; i < stream.info_medicalslen; i += 2)
+                                    if (info_time.tv_sec >= stream.info_medicals[i] - MEDICAL_EXTEND && (info_time.tv_sec <= stream.info_medicals[i + 1] + MEDICAL_EXTEND))
+                                    {
+                                        in_medical_idx = i;
+                                        break;
+                                    }
+
+                                if (in_medical_idx == -1)
+                                {
+                                    if (stream.info_medicalslen < MAX_MEDICALS && action == A_MEDICAL_START)
+                                    {
+                                        // new
+                                        for (i = 0; i < stream.info_medicalslen; i += 2)
+                                            if (stream.info_medicals[i + 1] >= stream.info_time.tv_sec)
+                                                break;
+
+                                        memmove(stream.info_medicals + i + 2, stream.info_medicals + i, sizeof(stream.info_medicals[0]) * stream.info_medicalslen - i);
+
+                                        stream.info_medicals[i] = info_time.tv_sec;
+                                        stream.info_medicals[i + 1] = LONG_MAX - MEDICAL_EXTEND;
+                                        stream.info_medicalslen += 2;
+                                        stream.info_updating = true;
+                                    }
+                                }
+                                else
+                                {
+                                    // move start or end
+                                    if (action == A_MEDICAL_START && info_time.tv_sec <= stream.info_medicals[in_medical_idx + 1])
+                                        stream.info_medicals[in_medical_idx] = info_time.tv_sec;
+                                    if (action == A_MEDICAL_STOP && info_time.tv_sec >= stream.info_medicals[in_medical_idx])
+                                        stream.info_medicals[in_medical_idx + 1] = info_time.tv_sec;
+
+                                    // delete
+                                    if (stream.info_medicals[in_medical_idx + 1] - stream.info_medicals[in_medical_idx] < MEDICAL_DELETE)
+                                    {
+                                        memmove(stream.info_medicals + in_medical_idx, stream.info_medicals + in_medical_idx + 2, sizeof(stream.info_medicals[0]) * stream.info_medicalslen - 2);
+                                        stream.info_medicalslen -= 2;
+                                    }
+                                    stream.info_updating = true;
+                                }
+
+                                if (stream.info_updating)
+                                    mat_patch("medicals", stream.info_medicals, stream.info_medicalslen);
+                                CAZ(pthread_mutex_unlock(&stream.info_mutex));
+                            }
+
+                            stream.info_updating = false;
+                            stream.hid_action = action;
+                            stream.hid_param = param;
+                            stream.info_changed = true;
+                        }
+                        break;
                         case A_NONE: // not changed
                         default:
                             stream.hid_action = action;
@@ -1382,12 +1708,29 @@ void *stream_info_thread(void *param)
 
         CAZ(pthread_mutex_lock(&stream.info_mutex));
         struct timespec info_time = stream.info_time;
+        bool in_bookmark = false;
+        int in_bookmark_idx = -1;
+        for (i = 0; i < stream.info_bookmarkslen; i++)
+            if (info_time.tv_sec >= stream.info_bookmarks[i] && (i == stream.info_bookmarkslen - 1 || info_time.tv_sec < stream.info_bookmarks[i + 1]))
+            {
+                in_bookmark_idx = i;
+                in_bookmark = info_time.tv_sec <= stream.info_bookmarks[i] + BOOKMARK_DELAY;
+                break;
+            }
+        bool in_startmedical = false, in_stopmedical = false;
+        for (i = 0; i < stream.info_medicalslen; i += 2)
+            if (info_time.tv_sec >= stream.info_medicals[i] - MEDICAL_EXTEND && (info_time.tv_sec <= stream.info_medicals[i + 1] + MEDICAL_EXTEND))
+            {
+                in_startmedical = info_time.tv_sec <= stream.info_medicals[i + 1];
+                in_stopmedical = info_time.tv_sec >= stream.info_medicals[i];
+                break;
+            }
         CAZ(pthread_mutex_unlock(&stream.info_mutex));
 
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
 
-        if (stream.gui == GUI_PLAYER && (info_time_prev != info_time.tv_sec || ts_prev != ts.tv_sec))
+        if ((stream.gui == GUI_EMPTY || stream.gui == GUI_PLAYER || stream.gui == GUI_BOOKMARKS) && (info_time_prev != info_time.tv_sec || ts_prev != ts.tv_sec))
         {
             stream.info_changed = true;
             info_time_prev = info_time.tv_sec;
@@ -1482,7 +1825,38 @@ void *stream_info_thread(void *param)
                 }
             break;
 
+        case GUI_BOOKMARKS:
+            info_img(fb, INFO_MAT_X + 2 * (INFO_MAT_W + INFO_BORDER) + INFO_BORDER, INFO_MAT_Y, &stream.info_oimg[INFO_OIMG_BOOKMARKSHOWSEL], false);
+
+            i = 0;
+            for (y = INFO_BOOKMARK_Y; y < INFO_HEIGHT - INFO_BOOKMARK_H + INFO_BORDER && i < stream.info_bookmarkslen; y += INFO_BOOKMARK_H + INFO_BORDER)
+                for (x = INFO_BOOKMARK_X; x < INFO_WIDTH - INFO_BOOKMARK_W + 2 * INFO_BORDER && i < stream.info_bookmarkslen; x += INFO_BOOKMARK_W + INFO_BORDER)
+                {
+                    info_fill(fb, x, y, INFO_BOOKMARK_W, INFO_BOOKMARK_H, in_bookmark_idx == i ? INFO_BOOKMARK_BGS : INFO_BOOKMARK_BG);
+
+                    uint32_t fx = x + INFO_BORDER, fy = y + INFO_BORDER - 5 + INFO_FONT_LINE;
+                    strftime(str, sizeof(str), "%H:%M:%S", localtime(&stream.info_bookmarks[i]));
+                    for (c = str; *c; c++)
+                        stream_draw_unicode(fb, &fx, &fy, in_bookmark_idx == i ? INFO_BOOKMARK_FGS : INFO_BOOKMARK_FG, *c);
+                    if (in_bookmark_idx == i)
+                    {
+                        fx = x + INFO_BOOKMARK_W - INFO_BORDER - 30;
+                        stream_draw_unicode(fb, &fx, &fy, INFO_BOOKMARK_FGD, 0x00002715);
+                    }
+                    i++;
+                }
+
         case GUI_PLAYER:
+        case GUI_EMPTY:
+
+            if (mat)
+            {
+                if (stream.gui == GUI_EMPTY)
+                    stream.gui = GUI_PLAYER;
+            }
+            else
+                stream.gui = GUI_EMPTY;
+
             // TIMERS
             info_fill(fb, INFO_TIME_X, INFO_TIME_Y, INFO_TIME_W, INFO_TIME_H, INFO_ALPHA);
 
@@ -1540,6 +1914,19 @@ void *stream_info_thread(void *param)
                 on = ts.tv_sec <= 6 + 1 * stream.info_restore_prev;
                 stream.info_restore_prev = on;
                 info_img(fb, INFO_RESTORE_X, INFO_BOTTOM_Y, &stream.info_rimg[on], false);
+
+                if (stream.gui == GUI_PLAYER)
+                {
+                    // playeronly
+                    info_img(fb, INFO_MAT_X + (INFO_MAT_W + INFO_BORDER) + INFO_BORDER, INFO_MAT_Y, &stream.info_oimg[in_bookmark ? INFO_OIMG_BOOKMARKADDSEL : INFO_OIMG_BOOKMARKADD], false);
+                    info_img(fb, INFO_MAT_X + 2 * (INFO_MAT_W + INFO_BORDER) + INFO_BORDER, INFO_MAT_Y, &stream.info_oimg[INFO_OIMG_BOOKMARKSHOW], false);
+                    info_img(fb, INFO_MAT_X + 3 * (INFO_MAT_W + INFO_BORDER) + 2 * INFO_BORDER, INFO_MAT_Y, &stream.info_oimg[in_startmedical ? INFO_OIMG_MEDICALSTARTSEL : INFO_OIMG_MEDICALSTART], false);
+                    info_img(fb, INFO_MAT_X + 4 * (INFO_MAT_W + INFO_BORDER) + 2 * INFO_BORDER, INFO_MAT_Y, &stream.info_oimg[in_stopmedical ? INFO_OIMG_MEDICALSTOPSEL : INFO_OIMG_MEDICALSTOP], false);
+                    if (in_startmedical && in_stopmedical)
+                    {
+                        info_img(fb, INFO_WIDTH / 2 - stream.info_oimg[INFO_OIMG_MEDICAL].width / 2, INFO_HEIGHT / 2 - stream.info_oimg[INFO_OIMG_MEDICAL].height / 2, &stream.info_oimg[INFO_OIMG_MEDICAL], false);
+                    }
+                }
             }
             break;
         }
@@ -1619,21 +2006,32 @@ void info_setup()
         }
     }
     stream.info_fimg.map = info_read_png(INFO_FIMG, &stream.info_fimg.width, &stream.info_fimg.height);
+    for (i = 0; i < sizeof(stream.info_oimg) / sizeof(stream.info_oimg[0]); i++)
+    {
+        char fn[128];
+        snprintf(fn, sizeof(fn), INFO_OIMG, i);
+        stream.info_oimg[i].map = info_read_png(fn, &stream.info_oimg[i].width, &stream.info_oimg[i].height);
+    }
 
     // action setup PLAYER
     stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, INFO_MAT_X, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_MAT};
-    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, 0, 0, INFO_MAT_W + 2 * INFO_BORDER, INFO_MAT_H + 2 * INFO_BORDER, A_NONE};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, INFO_RESTORE_X, INFO_BOTTOM_Y, INFO_RESTORE_W, INFO_BOTTOM_H, A_RESTORE};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, INFO_MAT_X + (INFO_MAT_W + INFO_BORDER) + INFO_BORDER, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_BOOKMARK_ADD};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, INFO_MAT_X + 2 * (INFO_MAT_W + INFO_BORDER) + INFO_BORDER, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_BOOKMARK_SHOW};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, INFO_MAT_X + 3 * (INFO_MAT_W + INFO_BORDER) + 2 * INFO_BORDER, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_MEDICAL_START};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, INFO_MAT_X + 4 * (INFO_MAT_W + INFO_BORDER) + 2 * INFO_BORDER, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_MEDICAL_STOP};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, 0, 0, 5 * (INFO_MAT_W + INFO_BORDER) + 2 * INFO_BORDER, INFO_MAT_H + 2 * INFO_BORDER, A_NONE};
+
     for (i = 0; i < MAX_CAM; i++)
     {
         stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, INFO_CAM_X + i * (INFO_CAM_W + INFO_BORDER), INFO_BOTTOM_Y, INFO_CAM_W, INFO_BOTTOM_H, A_CAM, i};
     }
-    x = INFO_SPEED_X;
+    x = INFO_SPEED_X - INFO_SPEED_BORDER / 2;
     for (i = 0; i < -SPEED_BCK_SKIP + SPEED_SKIP + 1; i++)
     {
-        stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, x, INFO_BOTTOM_Y, stream.info_width[i], INFO_BOTTOM_H, A_SPEED, i + SPEED_BCK_SKIP};
+        stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, x, INFO_BOTTOM_Y, stream.info_width[i] + INFO_SPEED_BORDER, INFO_BOTTOM_H, A_SPEED, i + SPEED_BCK_SKIP};
         x += stream.info_width[i] + INFO_SPEED_BORDER;
     }
-    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, INFO_RESTORE_X, INFO_BOTTOM_Y, INFO_RESTORE_W, INFO_BOTTOM_H, A_RESTORE};
     stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, 0, INFO_BOTTOM_Y - INFO_BORDER, INFO_WIDTH, INFO_MAT_H + 2 * INFO_BORDER, A_NONE};
     stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_PLAYER, 0, 0, INFO_WIDTH, INFO_HEIGHT, A_MOVE};
 
@@ -1657,14 +2055,45 @@ void info_setup()
     // action setup BROWSE
     stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BROWSE, INFO_MAT_X, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_CFG_END};
     i = 0;
-    for (y = INFO_BROWSE_Y; y < INFO_HEIGHT - INFO_BROWSE_H + INFO_BORDER; y += INFO_BROWSE_H + INFO_BORDER)
-        for (x = INFO_BROWSE_X; x < INFO_WIDTH - INFO_BROWSE_W + 2 * INFO_BORDER; x += INFO_BROWSE_W + 2 * INFO_BORDER)
+    for (y = INFO_BROWSE_Y; y < INFO_HEIGHT - INFO_BROWSE_H + INFO_BORDER && i < MAX_BROWSE; y += INFO_BROWSE_H + INFO_BORDER)
+        for (x = INFO_BROWSE_X; x < INFO_WIDTH - INFO_BROWSE_W + 2 * INFO_BORDER && i < MAX_BROWSE; x += INFO_BROWSE_W + 2 * INFO_BORDER)
         {
             stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BROWSE, x, y, INFO_BROWSE_W - INFO_BORDER - 50, INFO_BROWSE_H, A_BRS_SELECT, i};
             stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BROWSE, x + INFO_BROWSE_W - INFO_BORDER - 50, y, 50, INFO_BROWSE_H, A_BRS_DELETE, i};
             i++;
         }
     stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BROWSE, 0, 0, INFO_WIDTH, INFO_HEIGHT, A_NONE};
+
+    // action setup BOOKMARKS
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BOOKMARKS, INFO_MAT_X, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_MAT};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BOOKMARKS, INFO_RESTORE_X, INFO_BOTTOM_Y, INFO_RESTORE_W, INFO_BOTTOM_H, A_RESTORE};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BOOKMARKS, INFO_MAT_X + 2 * (INFO_MAT_W + INFO_BORDER) + INFO_BORDER, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_BOOKMARK_SHOW};
+
+    for (i = 0; i < MAX_CAM; i++)
+    {
+        stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BOOKMARKS, INFO_CAM_X + i * (INFO_CAM_W + INFO_BORDER), INFO_BOTTOM_Y, INFO_CAM_W, INFO_BOTTOM_H, A_CAM, i};
+    }
+    x = INFO_SPEED_X - INFO_SPEED_BORDER / 2;
+    for (i = 0; i < -SPEED_BCK_SKIP + SPEED_SKIP + 1; i++)
+    {
+        stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BOOKMARKS, x, INFO_BOTTOM_Y, stream.info_width[i] + INFO_SPEED_BORDER, INFO_BOTTOM_H, A_SPEED, i + SPEED_BCK_SKIP};
+        x += stream.info_width[i] + INFO_SPEED_BORDER;
+    }
+
+    i = 0;
+    for (y = INFO_BOOKMARK_Y; y < INFO_HEIGHT - INFO_BOOKMARK_H + INFO_BORDER && i < MAX_BOOKMARKS; y += INFO_BOOKMARK_H + INFO_BORDER)
+        for (x = INFO_BOOKMARK_X; x < INFO_WIDTH - INFO_BOOKMARK_W + INFO_BORDER && i < MAX_BOOKMARKS; x += INFO_BOOKMARK_W + INFO_BORDER)
+        {
+            stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BOOKMARKS, x, y, INFO_BOOKMARK_W - INFO_BORDER - 50, INFO_BOOKMARK_H, A_BOOKMARK_SELECT, i};
+            stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BOOKMARKS, x + INFO_BOOKMARK_W - INFO_BORDER - 50, y, 50, INFO_BOOKMARK_H, A_BOOKMARK_DELETE, i};
+            i++;
+        }
+
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_BOOKMARKS, 0, 0, INFO_WIDTH, INFO_HEIGHT, A_NONE};
+
+    // empty gui
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_EMPTY, INFO_MAT_X, INFO_MAT_Y, INFO_MAT_W, INFO_MAT_H, A_MAT};
+    stream.hid_actions[stream.hid_actionslen++] = (action_rect_t){GUI_EMPTY, 0, 0, INFO_WIDTH, INFO_HEIGHT, A_NONE};
 }
 
 void info_cleanup(void)
@@ -2234,8 +2663,6 @@ static void *stream_loader_thread(void *data)
     struct timespec prev_ts;
     clock_gettime(CLOCK_REALTIME, &prev_ts);
 
-    // TODO: offline read once from filesystem, online read over RESTAPI
-
     while (!stream.stopping && !stream.switching)
     {
         struct timespec a_ts;
@@ -2597,6 +3024,14 @@ void *stream_cmd_thread(void *param)
             if (config)
             {
                 LOG("C: switch stream mat %d cam %d day %s\n", config->mat, config->position, stream.day);
+                if (stream.info_loadedmat != config->mat)
+                {
+                    CAZ(pthread_mutex_lock(&stream.info_mutex));
+                    stream.info_loadedmat = stream.info_bookmarkslen = stream.info_medicalslen = 0;
+                    CAZ(pthread_mutex_unlock(&stream.info_mutex));
+                    mat_load(config->mat);
+                }
+
                 stream.switching = false;
                 stream.show_id = stream.show_ms = stream.chlen = 0;
                 CAZ(pthread_create(&stream.loader_tid, NULL, stream_loader_thread, NULL));
@@ -2715,7 +3150,7 @@ int main(int argc, char **argv)
 
     while (!stream.stopping)
     {
-        if (stream.gui != GUI_BROWSE && stream.camid == stream.camid_switch)
+        if ((stream.gui == GUI_PLAYER || stream.gui == GUI_CONFIG || stream.gui == GUI_BOOKMARKS) && stream.camid == stream.camid_switch)
         {
             CAZ(pthread_mutex_lock(&stream.cmd_mutex));
 
@@ -2726,6 +3161,8 @@ int main(int argc, char **argv)
                 stream.camid_switch = 0;
                 stream.info_changed = true;
             }
+            else if (stream.gui == GUI_PLAYER || stream.gui == GUI_BOOKMARKS)
+                mat_load(config->mat);
 
             CAZ(pthread_cond_signal(&stream.cmd_cond));
             CAZ(pthread_mutex_unlock(&stream.cmd_mutex));
